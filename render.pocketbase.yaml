@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: rider-ops-pocketbase
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.pocketbase
+    dockerContext: .
+    envVars:
+      - key: PORT
+        value: "10000"
+    disk:
+      name: pb-data
+      mountPath: /pb/pb_data
+      sizeGB: 1

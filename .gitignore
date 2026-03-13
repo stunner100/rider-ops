@@ -1,5 +1,7 @@
 # ─── Data (NEVER push rider data to GitHub) ───────────────────────────────────
 data/
+pb_data/
+pb_backups/
 *.csv
 *.xlsx
 
@@ -10,6 +12,7 @@ __pycache__/
 *.pyo
 .Python
 .env
+.env.*
 *.egg-info/
 
 # ─── macOS ────────────────────────────────────────────────────────────────────

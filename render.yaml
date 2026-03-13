@@ -1,13 +1,13 @@
 services:
   - type: web
-    name: rider-ops-dashboard
-    env: python
+    name: rider-ops
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
     envVars:
       - key: POCKETBASE_URL
-        value: https://rider-ops.onrender.com
+        value: https://rider-ops-pocketbase.onrender.com
       - key: POCKETBASE_MASTER_COLLECTION
         value: master_orders
       - key: POCKETBASE_UPLOAD_LOG_COLLECTION
