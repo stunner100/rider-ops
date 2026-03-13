@@ -1,0 +1,20 @@
+# ─── Data (NEVER push rider data to GitHub) ───────────────────────────────────
+data/
+*.csv
+*.xlsx
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.env
+*.egg-info/
+
+# ─── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ─── Streamlit ────────────────────────────────────────────────────────────────
+# NOTE: .streamlit/config.toml IS safe to commit (it only has theme settings)
+# and is REQUIRED by Streamlit Community Cloud - so we do NOT ignore it.

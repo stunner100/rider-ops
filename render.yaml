@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: rider-ops-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: POCKETBASE_URL
+        value: https://<YOUR_POCKETBASE_HOST>
+      - key: POCKETBASE_MASTER_COLLECTION
+        value: master_orders
+      - key: POCKETBASE_UPLOAD_LOG_COLLECTION
+        value: upload_log
+      - key: POCKETBASE_PAGE_SIZE
+        value: 200
+      - key: POCKETBASE_API_TOKEN
+        sync: false
