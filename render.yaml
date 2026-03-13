@@ -7,7 +7,7 @@ services:
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
     envVars:
       - key: POCKETBASE_URL
-        value: https://<YOUR_POCKETBASE_HOST>
+        value: https://rider-ops.onrender.com
       - key: POCKETBASE_MASTER_COLLECTION
         value: master_orders
       - key: POCKETBASE_UPLOAD_LOG_COLLECTION
