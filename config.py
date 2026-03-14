@@ -12,7 +12,12 @@ UPLOAD_LOG_FILE = os.path.join(DATA_DIR, "upload_log.csv")
 
 load_dotenv()
 
-# ─── PocketBase Configuration ─────────────────────────────────────────────────
+# ─── Neon / Postgres Configuration ────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_MASTER_TABLE = os.getenv("DATABASE_MASTER_TABLE", "master_orders").strip() or "master_orders"
+DATABASE_UPLOAD_LOG_TABLE = os.getenv("DATABASE_UPLOAD_LOG_TABLE", "upload_log").strip() or "upload_log"
+
+# ─── Legacy PocketBase Configuration (kept for older helper scripts) ─────────
 POCKETBASE_URL = os.getenv("POCKETBASE_URL", "").strip()
 POCKETBASE_API_TOKEN = os.getenv("POCKETBASE_API_TOKEN", "").strip()
 POCKETBASE_MASTER_COLLECTION = os.getenv("POCKETBASE_MASTER_COLLECTION", "master_orders")
@@ -43,6 +48,7 @@ OPTIONAL_COLUMNS = [
     "pickup_time", "dispatch_time", "delivered_time",
     "vendor", "zone", "cancellation_reason",
 ]
+# Persisted order and upload-log fields.
 MASTER_COLLECTION_FIELDS = [
     "order_id", "order_datetime", "rider_name", "order_status",
     "dispatch_time", "pickup_time", "delivered_time",

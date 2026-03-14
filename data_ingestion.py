@@ -1,21 +1,38 @@
 """
 Data ingestion module: validate, clean, deduplicate, and append rider order data.
 """
-import pandas as pd
-from datetime import datetime
 import os
+from datetime import datetime
 from typing import Any
+
+import pandas as pd
+
 try:
-    import requests
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+    from psycopg.types.json import Jsonb
 except Exception:  # pragma: no cover
-    requests = None
+    psycopg = None
+    sql = None
+    dict_row = None
+    Jsonb = None
 
 from config import (
-    REQUIRED_COLUMNS, DATA_DIR, MASTER_FILE, UPLOAD_LOG_FILE, COLUMN_ALIASES,
-    POCKETBASE_URL, POCKETBASE_API_TOKEN, POCKETBASE_MASTER_COLLECTION,
-    POCKETBASE_UPLOAD_LOG_COLLECTION, POCKETBASE_PAGE_SIZE, MASTER_COLLECTION_FIELDS,
-    POCKETBASE_ADMIN_EMAIL, POCKETBASE_ADMIN_PASSWORD,
+    COLUMN_ALIASES,
+    DATA_DIR,
+    DATABASE_MASTER_TABLE,
+    DATABASE_UPLOAD_LOG_TABLE,
+    DATABASE_URL,
+    MASTER_COLLECTION_FIELDS,
+    MASTER_FILE,
+    REQUIRED_COLUMNS,
+    UPLOAD_LOG_COLLECTION_FIELDS,
+    UPLOAD_LOG_FILE,
 )
+
+
+_DATABASE_SCHEMA_READY = False
 
 
 def ensure_data_dir():
@@ -28,138 +45,106 @@ def _normalize_column_name(name: str) -> str:
     return " ".join(str(name).strip().lower().split())
 
 
-def _pocketbase_enabled() -> bool:
-    has_token = bool(POCKETBASE_API_TOKEN)
-    has_login = bool(POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD)
-    return bool(POCKETBASE_URL and requests and (has_token or has_login))
+def _database_enabled() -> bool:
+    return bool(DATABASE_URL and psycopg)
 
 
-_POCKETBASE_RUNTIME_TOKEN = None
+def _db_connect(**kwargs):
+    if not _database_enabled():
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return psycopg.connect(DATABASE_URL, **kwargs)
 
 
-def _pocketbase_token() -> str:
-    global _POCKETBASE_RUNTIME_TOKEN
-    if POCKETBASE_API_TOKEN:
-        return POCKETBASE_API_TOKEN
-    if _POCKETBASE_RUNTIME_TOKEN:
-        return _POCKETBASE_RUNTIME_TOKEN
-
-    if not POCKETBASE_ADMIN_EMAIL or not POCKETBASE_ADMIN_PASSWORD:
-        raise RuntimeError(
-            "PocketBase is configured without POCKETBASE_API_TOKEN. Set POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD."
-        )
-
-    response = requests.post(
-        f"{POCKETBASE_URL.rstrip('/')}/api/collections/_superusers/auth-with-password",
-        headers={"Content-Type": "application/json"},
-        json={
-            "identity": POCKETBASE_ADMIN_EMAIL,
-            "password": POCKETBASE_ADMIN_PASSWORD,
-        },
-        timeout=20,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"PocketBase superuser auth failed ({response.status_code}): {response.text}"
-        )
-    token = response.json().get("token")
-    if not token:
-        raise RuntimeError("PocketBase superuser auth response did not include token.")
-    _POCKETBASE_RUNTIME_TOKEN = token
-    return token
+def _database_identifier(name: str):
+    return sql.Identifier(name)
 
 
-def _clear_pocketbase_token():
-    global _POCKETBASE_RUNTIME_TOKEN
-    _POCKETBASE_RUNTIME_TOKEN = None
+def _database_columns(names: list[str]):
+    return sql.SQL(", ").join(_database_identifier(name) for name in names)
 
 
-def _pocketbase_headers():
-    return {
-        "Authorization": f"Bearer {_pocketbase_token()}",
-        "Content-Type": "application/json",
-    }
+def _ensure_database_schema():
+    global _DATABASE_SCHEMA_READY
+    if _DATABASE_SCHEMA_READY or not _database_enabled():
+        return
+
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {} (
+                        order_id TEXT PRIMARY KEY,
+                        order_datetime TIMESTAMP NOT NULL,
+                        rider_name TEXT NOT NULL,
+                        order_status TEXT NOT NULL,
+                        dispatch_time TIMESTAMP NULL,
+                        pickup_time TIMESTAMP NULL,
+                        delivered_time TIMESTAMP NULL,
+                        dispatched_at TIMESTAMP NULL,
+                        delivered_at TIMESTAMP NULL,
+                        vendor TEXT NULL,
+                        zone TEXT NULL,
+                        cancellation_reason TEXT NULL,
+                        meta JSONB NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                ).format(_database_identifier(DATABASE_MASTER_TABLE))
+            )
+            cur.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (order_datetime)").format(
+                    _database_identifier(f"{DATABASE_MASTER_TABLE}_order_datetime_idx"),
+                    _database_identifier(DATABASE_MASTER_TABLE),
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {} (
+                        id BIGSERIAL PRIMARY KEY,
+                        timestamp TIMESTAMP NOT NULL,
+                        filename TEXT NOT NULL,
+                        rows_in_file INTEGER NOT NULL,
+                        rows_after_cleaning INTEGER NOT NULL,
+                        rows_dropped_during_cleaning INTEGER NOT NULL,
+                        rows_added INTEGER NOT NULL,
+                        duplicates_removed INTEGER NOT NULL,
+                        total_master_rows INTEGER NOT NULL,
+                        errors TEXT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                ).format(_database_identifier(DATABASE_UPLOAD_LOG_TABLE))
+            )
+            cur.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (timestamp DESC)").format(
+                    _database_identifier(f"{DATABASE_UPLOAD_LOG_TABLE}_timestamp_idx"),
+                    _database_identifier(DATABASE_UPLOAD_LOG_TABLE),
+                )
+            )
+
+    _DATABASE_SCHEMA_READY = True
 
 
-def _pocketbase_url(path: str) -> str:
-    return f"{POCKETBASE_URL.rstrip('/')}/{path.lstrip('/')}"
+def _is_missing_value(value: Any) -> bool:
+    try:
+        result = pd.isna(value)
+    except TypeError:
+        return False
+    return bool(result)
 
 
-def _pocketbase_request(method: str, path: str, params: dict = None, json_body=None) -> Any:
-    if not _pocketbase_enabled():
-        raise RuntimeError("PocketBase is not configured.")
-
-    last_error = None
-    for _ in range(2):
-        response = requests.request(
-            method=method,
-            url=_pocketbase_url(path),
-            headers=_pocketbase_headers(),
-            params=params,
-            json=json_body,
-            timeout=20,
-        )
-        if response.status_code != 401:
-            return response
-
-        # If token expired and we can re-auth with admin credentials, retry once with a new token.
-        if POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD:
-            _clear_pocketbase_token()
-            last_error = response
-            continue
-        return response
-
-    return last_error
+def _clean_sql_value(value: Any) -> Any:
+    if _is_missing_value(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return value
 
 
-def _pocketbase_request_data(method: str, path: str, params: dict = None, json_body=None) -> dict:
-    response = _pocketbase_request(method, path, params=params, json_body=json_body)
-    if response.status_code >= 400:
-        detail = response.text.strip() if response.text else "No response body"
-        raise RuntimeError(f"PocketBase request failed ({response.status_code}) {path}: {detail}")
-    if not response.text:
-        return {}
-    return response.json()
-
-
-def _pocketbase_fetch_all_records(collection: str, extra_params: dict = None) -> list:
-    if not _pocketbase_enabled():
-        return []
-
-    page = 1
-    records = []
-
-    while True:
-        params = {
-            "page": page,
-            "perPage": POCKETBASE_PAGE_SIZE,
-        }
-        if extra_params:
-            params.update(extra_params)
-
-        try:
-            data = _pocketbase_request_data("GET", f"api/collections/{collection}/records", params=params)
-        except Exception:
-            raise
-
-        items = data.get("items", [])
-        if not items:
-            break
-
-        records.extend(items)
-
-        total_pages = data.get("totalPages")
-        if total_pages is not None and page >= int(total_pages):
-            break
-        if len(items) < POCKETBASE_PAGE_SIZE:
-            break
-        page += 1
-
-    return records
-
-
-def _clean_payload_value(value):
-    if pd.isna(value):
+def _clean_json_value(value: Any) -> Any:
+    if _is_missing_value(value):
         return None
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime().isoformat()
@@ -168,21 +153,19 @@ def _clean_payload_value(value):
     return value
 
 
-def _row_to_payload(row: pd.Series, allowed_fields: list = None) -> dict:
+def _row_to_record(row: dict, allowed_fields: list[str] | None = None) -> dict:
     allowed_set = set(allowed_fields) if allowed_fields else None
     payload = {}
     extras = {}
-    for key, value in row.items():
-        if key in {"id", "collectionId", "collectionName", "created", "updated", "expand"}:
-            continue
-        if allowed_set is not None and key not in allowed_set:
-            extras[key] = _clean_payload_value(value)
-            continue
-        payload[key] = _clean_payload_value(value)
 
-    # Preserve any unknown upload columns in an optional JSON field.
+    for key, value in row.items():
+        if allowed_set is not None and key not in allowed_set:
+            extras[key] = _clean_json_value(value)
+            continue
+        payload[key] = _clean_sql_value(value)
+
     if allowed_set is not None and "meta" in allowed_set:
-        payload["meta"] = extras or None
+        payload["meta"] = {k: v for k, v in extras.items() if v is not None} or None
 
     return payload
 
@@ -204,22 +187,25 @@ def _load_master_csv() -> pd.DataFrame:
     return df
 
 
-def _load_master_from_pocketbase() -> pd.DataFrame:
-    if not _pocketbase_enabled():
+def _load_master_from_database() -> pd.DataFrame:
+    if not _database_enabled():
         return _load_master_csv()
 
-    records = _pocketbase_fetch_all_records(
-        POCKETBASE_MASTER_COLLECTION,
-        extra_params={"fields": "*,created,updated"},
-    )
+    _ensure_database_schema()
+    with _db_connect(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SELECT {} FROM {} ORDER BY order_datetime ASC").format(
+                    _database_columns(MASTER_COLLECTION_FIELDS),
+                    _database_identifier(DATABASE_MASTER_TABLE),
+                )
+            )
+            records = cur.fetchall()
+
     if not records:
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    for col in ["id", "collectionId", "collectionName", "created", "updated", "expand"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
-
     if "order_datetime" in df.columns:
         df["order_datetime"] = pd.to_datetime(df["order_datetime"], errors="coerce")
     for col in ["dispatch_time", "pickup_time", "delivered_time", "dispatched_at", "delivered_at"]:
@@ -240,15 +226,41 @@ def _load_upload_log_csv() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _log_upload_to_pocketbase(entry: dict):
-    if not _pocketbase_enabled():
+def _log_upload_to_database(entry: dict):
+    if not _database_enabled():
         return
 
-    _pocketbase_request_data(
-        "POST",
-        f"api/collections/{POCKETBASE_UPLOAD_LOG_COLLECTION}/records",
-        json_body=entry,
-    )
+    _ensure_database_schema()
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        timestamp,
+                        filename,
+                        rows_in_file,
+                        rows_after_cleaning,
+                        rows_dropped_during_cleaning,
+                        rows_added,
+                        duplicates_removed,
+                        total_master_rows,
+                        errors
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                ).format(_database_identifier(DATABASE_UPLOAD_LOG_TABLE)),
+                (
+                    _clean_sql_value(entry.get("timestamp")),
+                    entry.get("filename"),
+                    entry.get("rows_in_file", 0),
+                    entry.get("rows_after_cleaning", 0),
+                    entry.get("rows_dropped_during_cleaning", 0),
+                    entry.get("rows_added", 0),
+                    entry.get("duplicates_removed", 0),
+                    entry.get("total_master_rows", 0),
+                    entry.get("errors", ""),
+                ),
+            )
 
 
 def map_columns(df: pd.DataFrame) -> dict:
@@ -259,16 +271,16 @@ def map_columns(df: pd.DataFrame) -> dict:
     Returns a result dict:
         {
             "mapped": {original_name: internal_name, ...},
-            "unmapped_required": [internal_name, ...],   # required fields with no alias found
-            "extra": [col_name, ...],                     # columns left unchanged
+            "unmapped_required": [internal_name, ...],
+            "extra": [col_name, ...],
         }
     """
     file_columns = list(df.columns)
     normalized_columns = {}
     for col in file_columns:
         normalized_columns.setdefault(_normalize_column_name(col), col)
-    rename_map = {}        # {original_col -> internal_name}
-    resolved = set()       # set of internal names that have been matched
+    rename_map = {}
+    resolved = set()
 
     for internal_name, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
@@ -278,17 +290,12 @@ def map_columns(df: pd.DataFrame) -> dict:
                 resolved.add(internal_name)
                 break
 
-    # Apply the renames
     if rename_map:
         df.rename(columns=rename_map, inplace=True)
 
-    # Strip whitespace from remaining column names so downstream validation is consistent.
     df.columns = [str(col).strip() for col in df.columns]
 
-    # Figure out which required columns are still missing after mapping
     unmapped_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-
-    # Columns that weren't mapped and aren't known internal names
     all_internal = set(COLUMN_ALIASES.keys())
     extra = [c for c in df.columns if c not in all_internal]
 
@@ -316,7 +323,6 @@ def validate_csv(df: pd.DataFrame) -> dict:
         errors.append("File contains no data rows.")
 
     if not errors:
-        # Check for nulls in required cols
         for col in REQUIRED_COLUMNS:
             null_count = df[col].isna().sum()
             if null_count > 0:
@@ -330,8 +336,6 @@ def clean_data(df: pd.DataFrame, return_stats: bool = False):
     df = df.copy()
     original_count = len(df)
 
-    # Lightly normalize any remaining non-standard column names
-    # (map_columns already handles known aliases; this catches stragglers)
     df.columns = [str(c).strip() for c in df.columns]
 
     if "order_id" in df.columns:
@@ -339,27 +343,21 @@ def clean_data(df: pd.DataFrame, return_stats: bool = False):
         order_ids = order_ids.str.replace(r"\.0+$", "", regex=True)
         df["order_id"] = order_ids.replace("", pd.NA)
 
-    # Normalize rider names
     if "rider_name" in df.columns:
         rider_names = df["rider_name"].where(df["rider_name"].notna(), "").astype(str).str.strip().str.title()
         df["rider_name"] = rider_names.replace("", pd.NA)
 
-    # Parse order_datetime
     if "order_datetime" in df.columns:
         df["order_datetime"] = pd.to_datetime(df["order_datetime"], errors="coerce")
 
-    # Parse optional timestamp columns (support both old and alias-mapped names)
-    for col in ["dispatch_time", "pickup_time", "delivered_time",
-                "dispatched_at", "delivered_at"]:
+    for col in ["dispatch_time", "pickup_time", "delivered_time", "dispatched_at", "delivered_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Standardize order_status
     if "order_status" in df.columns:
         statuses = df["order_status"].where(df["order_status"].notna(), "").astype(str).str.strip().str.title()
         df["order_status"] = statuses.replace("", pd.NA)
 
-    # Drop rows where required fields are null after cleaning
     df = df.dropna(subset=["order_id", "order_datetime", "rider_name", "order_status"])
 
     if not return_stats:
@@ -380,10 +378,8 @@ def deduplicate(new_df: pd.DataFrame, master_df: pd.DataFrame = None) -> dict:
     """
     original_count = len(new_df)
 
-    # Internal dedup
     new_df = new_df.drop_duplicates(subset=["order_id"], keep="first")
 
-    # Cross-dedup against master
     if master_df is not None and not master_df.empty:
         existing_ids = set(master_df["order_id"].astype(str).values)
         new_df = new_df[~new_df["order_id"].astype(str).isin(existing_ids)]
@@ -397,10 +393,10 @@ def deduplicate(new_df: pd.DataFrame, master_df: pd.DataFrame = None) -> dict:
 
 
 def load_master() -> pd.DataFrame:
-    """Load the master orders dataset, from PocketBase when configured."""
-    if _pocketbase_enabled():
+    """Load the master orders dataset from Postgres when configured."""
+    if _database_enabled():
         try:
-            return _load_master_from_pocketbase()
+            return _load_master_from_database()
         except Exception:
             return _load_master_csv()
 
@@ -417,20 +413,52 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
     clean_new = dedup_result["clean_df"]
     rows_added = 0
 
-    if _pocketbase_enabled() and not clean_new.empty:
-        for row in clean_new.to_dict(orient="records"):
-            try:
-                _pocketbase_request_data(
-                    "POST",
-                    f"api/collections/{POCKETBASE_MASTER_COLLECTION}/records",
-                    json_body=_row_to_payload(pd.Series(row), allowed_fields=MASTER_COLLECTION_FIELDS),
-                )
-                rows_added += 1
-            except Exception as exc:
-                error_text = str(exc).lower()
-                if "unique" in error_text and "order_id" in error_text:
-                    continue
-                raise
+    if _database_enabled() and not clean_new.empty:
+        _ensure_database_schema()
+        insert_sql = sql.SQL(
+            """
+            INSERT INTO {} (
+                order_id,
+                order_datetime,
+                rider_name,
+                order_status,
+                dispatch_time,
+                pickup_time,
+                delivered_time,
+                dispatched_at,
+                delivered_at,
+                vendor,
+                zone,
+                cancellation_reason,
+                meta
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (order_id) DO NOTHING
+            """
+        ).format(_database_identifier(DATABASE_MASTER_TABLE))
+
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                for row in clean_new.to_dict(orient="records"):
+                    payload = _row_to_record(row, allowed_fields=MASTER_COLLECTION_FIELDS)
+                    cur.execute(
+                        insert_sql,
+                        (
+                            payload.get("order_id"),
+                            payload.get("order_datetime"),
+                            payload.get("rider_name"),
+                            payload.get("order_status"),
+                            payload.get("dispatch_time"),
+                            payload.get("pickup_time"),
+                            payload.get("delivered_time"),
+                            payload.get("dispatched_at"),
+                            payload.get("delivered_at"),
+                            payload.get("vendor"),
+                            payload.get("zone"),
+                            payload.get("cancellation_reason"),
+                            Jsonb(payload["meta"]) if payload.get("meta") is not None else None,
+                        ),
+                    )
+                    rows_added += max(cur.rowcount, 0)
     elif not clean_new.empty:
         if master_df.empty:
             combined = clean_new.copy()
@@ -438,11 +466,6 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
             combined = pd.concat([master_df, clean_new], ignore_index=True)
         _save_master_csv(combined)
         rows_added = len(clean_new)
-    else:
-        rows_added = 0
-
-    if not _pocketbase_enabled():
-        combined = pd.concat([master_df, clean_new], ignore_index=True) if not clean_new.empty else master_df
 
     return {
         "rows_added": rows_added,
@@ -459,9 +482,10 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
 
 
 def log_upload(filename: str, stats: dict):
-    """Log an upload event to the upload log CSV."""
+    """Log an upload event to Postgres when configured, otherwise CSV."""
+    timestamp = datetime.now()
     entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": timestamp,
         "filename": filename,
         "rows_in_file": stats.get("original_count", 0),
         "rows_after_cleaning": stats.get("cleaned_count", 0),
@@ -471,15 +495,17 @@ def log_upload(filename: str, stats: dict):
         "total_master_rows": stats.get("total_rows", 0),
         "errors": "; ".join(stats.get("errors", [])),
     }
-    if _pocketbase_enabled():
+    if _database_enabled():
         try:
-            _log_upload_to_pocketbase(entry)
+            _log_upload_to_database(entry)
             return
         except Exception:
             pass
 
     ensure_data_dir()
-    entry_df = pd.DataFrame([entry])
+    csv_entry = dict(entry)
+    csv_entry["timestamp"] = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    entry_df = pd.DataFrame([csv_entry])
     if os.path.exists(UPLOAD_LOG_FILE):
         log_df = pd.read_csv(UPLOAD_LOG_FILE)
         log_df = pd.concat([log_df, entry_df], ignore_index=True)
@@ -490,19 +516,24 @@ def log_upload(filename: str, stats: dict):
 
 def load_upload_log() -> pd.DataFrame:
     """Load the upload log, or return empty DataFrame."""
-    if _pocketbase_enabled():
+    if _database_enabled():
         try:
-            records = _pocketbase_fetch_all_records(
-                POCKETBASE_UPLOAD_LOG_COLLECTION,
-                extra_params={"fields": "timestamp,filename,rows_in_file,rows_after_cleaning,rows_dropped_during_cleaning,rows_added,duplicates_removed,total_master_rows,errors"},
-            )
+            _ensure_database_schema()
+            with _db_connect(row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql.SQL("SELECT {} FROM {} ORDER BY timestamp DESC").format(
+                            _database_columns(UPLOAD_LOG_COLLECTION_FIELDS),
+                            _database_identifier(DATABASE_UPLOAD_LOG_TABLE),
+                        )
+                    )
+                    records = cur.fetchall()
             if records:
                 df = pd.DataFrame(records)
-                for col in ["id", "collectionId", "collectionName", "created", "updated", "expand"]:
-                    if col in df.columns:
-                        df = df.drop(columns=[col])
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
                 return df
             return pd.DataFrame()
         except Exception:
             return _load_upload_log_csv()
-    return pd.DataFrame()
+    return _load_upload_log_csv()

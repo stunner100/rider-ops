@@ -6,13 +6,9 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
     envVars:
-      - key: POCKETBASE_URL
-        value: https://rider-ops-pocketbase.onrender.com
-      - key: POCKETBASE_MASTER_COLLECTION
+      - key: DATABASE_MASTER_TABLE
         value: master_orders
-      - key: POCKETBASE_UPLOAD_LOG_COLLECTION
+      - key: DATABASE_UPLOAD_LOG_TABLE
         value: upload_log
-      - key: POCKETBASE_PAGE_SIZE
-        value: 200
-      - key: POCKETBASE_API_TOKEN
+      - key: DATABASE_URL
         sync: false
