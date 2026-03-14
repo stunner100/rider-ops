@@ -45,6 +45,9 @@ def query(question: str, df: pd.DataFrame) -> dict:
     if _matches(q, ["how many rider", "riders needed", "riders do i need", "need for"]):
         return _riders_needed(df, weekday_filter, shift_filter)
 
+    if weekday_filter and _matches(q, ["rider", "who", "work", "works", "working"]):
+        return _riders_by_weekday(profiles, df, weekday_filter, shift_filter, n or 10, q)
+
     if _matches(q, ["evening", "night", "lunch", "morning", "afternoon"]) and _matches(q, ["rider", "who"]):
         shift = _extract_shift(q)
         return _riders_by_shift(profiles, df, shift)
@@ -213,6 +216,92 @@ def _riders_by_shift(profiles, df, shift):
         "table": result,
         "chart_type": "bar",
         "filters": f"Shift filter: {shift}",
+    }
+
+
+def _riders_by_weekday(profiles, df, weekday, shift, n, q):
+    activity = df.copy()
+    activity["order_datetime"] = pd.to_datetime(activity["order_datetime"], errors="coerce")
+    activity = activity.dropna(subset=["order_datetime", "rider_name"])
+    activity["weekday"] = activity["order_datetime"].dt.day_name()
+    activity["shift"] = activity["order_datetime"].dt.hour.apply(_assign_shift)
+
+    filtered = activity[activity["weekday"] == weekday]
+    if shift:
+        filtered = filtered[filtered["shift"] == shift]
+
+    if filtered.empty:
+        filters = [f"Weekday: {weekday}"]
+        if shift:
+            filters.append(f"Shift: {shift}")
+        return {
+            "answer": "No rider activity matched that day filter.",
+            "table": None,
+            "chart_type": None,
+            "filters": " | ".join(filters),
+        }
+
+    rider_summary = filtered.groupby("rider_name").agg(
+        matching_orders=("rider_name", "size"),
+        active_dates=("order_datetime", lambda s: s.dt.date.nunique()),
+    ).reset_index()
+
+    total_orders = activity.groupby("rider_name").size().reset_index(name="total_orders")
+    rider_summary = rider_summary.merge(total_orders, on="rider_name", how="left")
+    rider_summary["share_of_orders_pct"] = (
+        rider_summary["matching_orders"] / rider_summary["total_orders"].clip(lower=1) * 100
+    ).round(1)
+
+    rider_summary = rider_summary.merge(
+        profiles[
+            [
+                "rider_name",
+                "category",
+                "preferred_weekday",
+                "preferred_shift",
+                "attendance_consistency",
+                "avg_orders_per_day",
+            ]
+        ],
+        on="rider_name",
+        how="left",
+    )
+
+    if _matches(q, ["mostly", "mainly", "usually", "typically"]):
+        sort_cols = ["share_of_orders_pct", "matching_orders"]
+        ascending = [False, False]
+    else:
+        sort_cols = ["matching_orders", "share_of_orders_pct"]
+        ascending = [False, False]
+
+    result = rider_summary.sort_values(sort_cols, ascending=ascending).head(n)[
+        [
+            "rider_name",
+            "category",
+            "matching_orders",
+            "active_dates",
+            "share_of_orders_pct",
+            "avg_orders_per_day",
+            "preferred_weekday",
+            "preferred_shift",
+            "attendance_consistency",
+        ]
+    ]
+
+    filters = [f"Weekday: {weekday}"]
+    if shift:
+        filters.append(f"Shift: {shift}")
+
+    answer = f"Here are the riders most active on **{weekday}**"
+    if shift:
+        answer += f" during the **{shift}** shift"
+    answer += ":"
+
+    return {
+        "answer": answer,
+        "table": result,
+        "chart_type": "bar",
+        "filters": " | ".join(filters),
     }
 
 

@@ -33,6 +33,7 @@ from config import (
 
 
 _DATABASE_SCHEMA_READY = False
+_ORDER_ID_BATCH_SIZE = 1000
 
 
 def ensure_data_dir():
@@ -61,6 +62,28 @@ def _database_identifier(name: str):
 
 def _database_columns(names: list[str]):
     return sql.SQL(", ").join(_database_identifier(name) for name in names)
+
+
+def _fetch_existing_order_ids(cur, order_ids: list[str]) -> set[str]:
+    if not order_ids:
+        return set()
+
+    unique_ids = list(dict.fromkeys(order_ids))
+    if not unique_ids:
+        return set()
+
+    existing = set()
+    for offset in range(0, len(unique_ids), _ORDER_ID_BATCH_SIZE):
+        chunk = unique_ids[offset : offset + _ORDER_ID_BATCH_SIZE]
+        cur.execute(
+            sql.SQL("SELECT order_id FROM {} WHERE order_id = ANY(%s)").format(
+                _database_identifier(DATABASE_MASTER_TABLE)
+            ),
+            (chunk,),
+        )
+        existing.update(row[0] for row in cur.fetchall())
+
+    return existing
 
 
 def _ensure_database_schema():
@@ -213,6 +236,22 @@ def _load_master_from_database() -> pd.DataFrame:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
+
+
+def _count_master_rows() -> int:
+    if not _database_enabled():
+        return len(_load_master_csv())
+
+    _ensure_database_schema()
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SELECT COUNT(*) FROM {}").format(
+                    _database_identifier(DATABASE_MASTER_TABLE)
+                )
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
 
 
 def _save_upload_log_csv(df: pd.DataFrame):
@@ -408,10 +447,26 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
     Append new data to the master dataset.
     Returns stats: {rows_added, duplicates_removed, total_rows, original_count}.
     """
-    master_df = load_master()
-    dedup_result = deduplicate(new_df, master_df)
+    if new_df.empty:
+        current_count = 0
+        try:
+            current_count = _count_master_rows()
+        except Exception:
+            current_count = 0
+
+        return {
+            "rows_added": 0,
+            "duplicates_removed": 0,
+            "total_rows": current_count,
+            "original_count": original_count or 0,
+            "cleaned_count": original_count or 0,
+            "rows_dropped_during_cleaning": 0,
+        }
+
+    dedup_result = deduplicate(new_df)
     clean_new = dedup_result["clean_df"]
     rows_added = 0
+    existing_duplicates = 0
 
     if _database_enabled() and not clean_new.empty:
         _ensure_database_schema()
@@ -438,10 +493,27 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
 
         with _db_connect() as conn:
             with conn.cursor() as cur:
-                for row in clean_new.to_dict(orient="records"):
-                    payload = _row_to_record(row, allowed_fields=MASTER_COLLECTION_FIELDS)
-                    cur.execute(
-                        insert_sql,
+                cur.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {}").format(
+                        _database_identifier(DATABASE_MASTER_TABLE)
+                    )
+                )
+                current_count = int(cur.fetchone()[0] or 0)
+
+                incoming_ids = [str(v) for v in clean_new["order_id"].tolist()]
+                existing_ids = _fetch_existing_order_ids(cur, incoming_ids)
+                if existing_ids:
+                    existing_mask = clean_new["order_id"].astype(str).isin(existing_ids)
+                    existing_duplicates = int(existing_mask.sum())
+                    clean_new = clean_new.loc[~existing_mask]
+
+                rows_to_insert = [
+                    _row_to_record(row, allowed_fields=MASTER_COLLECTION_FIELDS)
+                    for row in clean_new.to_dict(orient="records")
+                ]
+                insert_params = []
+                for payload in rows_to_insert:
+                    insert_params.append(
                         (
                             payload.get("order_id"),
                             payload.get("order_datetime"),
@@ -456,10 +528,16 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
                             payload.get("zone"),
                             payload.get("cancellation_reason"),
                             Jsonb(payload["meta"]) if payload.get("meta") is not None else None,
-                        ),
+                        )
                     )
-                    rows_added += max(cur.rowcount, 0)
+
+                if insert_params:
+                    cur.executemany(insert_sql, insert_params)
+                    rows_added = len(insert_params)
+                    current_count += rows_added
+
     elif not clean_new.empty:
+        master_df = load_master()
         if master_df.empty:
             combined = clean_new.copy()
         else:
@@ -467,10 +545,15 @@ def append_to_master(new_df: pd.DataFrame, original_count: int = None) -> dict:
         _save_master_csv(combined)
         rows_added = len(clean_new)
 
+        if master_df.empty:
+            current_count = rows_added
+        else:
+            current_count = len(master_df) + rows_added
+
     return {
         "rows_added": rows_added,
-        "duplicates_removed": dedup_result["duplicates_removed"],
-        "total_rows": len(master_df) + rows_added,
+        "duplicates_removed": dedup_result["duplicates_removed"] + existing_duplicates,
+        "total_rows": current_count if _database_enabled() else current_count,
         "original_count": original_count if original_count is not None else dedup_result["original_count"],
         "cleaned_count": dedup_result["original_count"],
         "rows_dropped_during_cleaning": max(
